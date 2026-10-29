@@ -83,6 +83,8 @@ interface SelectContextValue {
   onOpenChange(open: boolean): void;
   dir: SelectProps['dir'];
   triggerPointerDownPosRef: React.MutableRefObject<{ x: number; y: number } | null>;
+  touchDismissClicksRef: React.MutableRefObject<WeakSet<Event>>;
+  onTouchDismiss(): void;
   disabled?: boolean | undefined;
   name?: string | undefined;
   autoComplete?: string | undefined;
@@ -202,6 +204,40 @@ function SelectProvider(props: ScopedProps<SelectProviderProps>) {
     caller: SELECT_NAME,
   });
   const triggerPointerDownPosRef = React.useRef<{ x: number; y: number } | null>(null);
+  const touchDismissClicksRef = React.useRef(new WeakSet<Event>());
+  const touchDismissCleanupRef = React.useRef<(() => void) | undefined>(undefined);
+  React.useEffect(() => () => touchDismissCleanupRef.current?.(), []);
+
+  function handleTouchDismiss() {
+    touchDismissCleanupRef.current?.();
+    if (!trigger) {
+      return;
+    }
+    const ownerDocument = trigger.ownerDocument;
+
+    function cleanup() {
+      ownerDocument.removeEventListener('pointerdown', cleanup, true);
+      ownerDocument.removeEventListener('pointercancel', cleanup, true);
+      ownerDocument.removeEventListener('keydown', cleanup, true);
+      ownerDocument.removeEventListener('click', handleClick, true);
+      touchDismissCleanupRef.current = undefined;
+    }
+
+    function handleClick(event: MouseEvent) {
+      // A compatibility click may change both pointerType and pointerId. The
+      // next click belongs to this gesture unless new input or cancellation intervenes.
+      if (event.detail !== 0) {
+        touchDismissClicksRef.current.add(event);
+      }
+      cleanup();
+    }
+
+    ownerDocument.addEventListener('pointerdown', cleanup, true);
+    ownerDocument.addEventListener('pointercancel', cleanup, true);
+    ownerDocument.addEventListener('keydown', cleanup, true);
+    ownerDocument.addEventListener('click', handleClick, true);
+    touchDismissCleanupRef.current = cleanup;
+  }
   const hasConsumerStoppedPropagationRef = React.useRef(false);
 
   // The latest value selected by the user. The bubble input notifies the form
@@ -272,6 +308,8 @@ function SelectProvider(props: ScopedProps<SelectProviderProps>) {
     onOpenChange: setOpen,
     dir: direction,
     triggerPointerDownPosRef,
+    touchDismissClicksRef,
+    onTouchDismiss: handleTouchDismiss,
     disabled,
     name,
     autoComplete,
@@ -394,6 +432,12 @@ const SelectTrigger = /* @__PURE__ */ React.forwardRef<SelectTriggerElement, Sel
             // because we are preventing default in `onPointerDown` so effectively
             // this only runs for a label "click"
             event.currentTarget.focus();
+
+            // Consume only the click marked by the touch dismissal, leaving consumer
+            // handlers and propagation intact, regardless of its reported pointer ID/type.
+            if (context.touchDismissClicksRef.current.delete(event.nativeEvent)) {
+              return;
+            }
 
             // Open on click when using a touch or pen device
             if (pointerTypeRef.current !== 'mouse') {
@@ -912,7 +956,14 @@ const SelectContentImpl = /* @__PURE__ */ React.forwardRef<
               asChild
               disableOutsidePointerEvents
               onEscapeKeyDown={onEscapeKeyDown}
-              onPointerDownOutside={onPointerDownOutside}
+              onPointerDownOutside={composeEventHandlers(onPointerDownOutside, (event) => {
+                // Hit testing may send the pointerdown to HTML and the subsequent
+                // click to the trigger after outside pointer events are restored.
+                const { pointerType } = event.detail.originalEvent;
+                if (pointerType === 'touch' || pointerType === 'pen') {
+                  context.onTouchDismiss();
+                }
+              })}
               // When focus is trapped, a focusout event may still happen.
               // We make sure we don't trigger our `onDismiss` in such case.
               onFocusOutside={(event) => event.preventDefault()}
